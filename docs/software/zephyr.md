@@ -10,6 +10,7 @@ https://docs.platformio.org/en/latest/tutorials/nordicnrf52/zephyr_debugging_uni
 https://www.novelbits.io/zephyr-getting-started-bluetooth-low-energy-development/
 https://docs.zephyrproject.org/latest/getting_started/index.html - official
 https://docs.zephyrproject.org/latest/application/index.html#application - how to format app and board tree
+https://www.zephyrproject.org/getting-started-with-zephyr-rtos-on-nordic-nrf52832-hackable/ 
 
 https://docs.zephyrproject.org/latest/guides/west/build-flash-debug.html#setting-a-default-board
 

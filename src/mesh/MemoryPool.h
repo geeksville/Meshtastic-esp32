@@ -107,7 +107,7 @@ template <class T> class MemoryPool : public Allocator<T>
                    maxElements); // sanity check to make sure a programmer didn't free something that didn't come from this pool
     }
 
-#ifdef HAS_FREE_RTOS
+#if 0 // removing ifdef HAS_FREE_RTOS
     /// Return a buffer from an ISR, if higherPriWoken is set to true you have some work to do ;-)
     void releaseFromISR(T *p, BaseType_t *higherPriWoken)
     {

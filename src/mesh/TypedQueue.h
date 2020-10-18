@@ -6,7 +6,8 @@
 #include "concurrency/OSThread.h"
 #include "freertosinc.h"
 
-#ifdef HAS_FREE_RTOS
+// We are trying to avoid using freertos specific code now
+#if 0 // ifdef HAS_FREE_RTOS
 
 /**
  * A wrapper for freertos queues.  Note: each element object should be small
