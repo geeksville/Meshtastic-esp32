@@ -22,6 +22,17 @@ port to run on zephyr - mynewt seems to have poor support for nrf52833 and poor 
 
 https://trends.google.com/trends/explore?date=2018-09-17%202020-10-17&geo=US&q=%2Fg%2F11c43x0zjj,%2Fg%2F11clw65g2k
 
+
+## other options?
+
+https://github.com/soburi/openthread_nrf52_arduino
+
+or on mbed?
+https://github.com/arduino/ArduinoCore-nRF528x-mbedos
+framework-arduino-nrf52-mbedos
+
+TODO - try framework-arduino-nrf52-mbedos experiment in platformio
+
 ## install
 
 ~/development/zephyrproject$ pip3 install -r ./zephyr/scripts/requirements.txt
