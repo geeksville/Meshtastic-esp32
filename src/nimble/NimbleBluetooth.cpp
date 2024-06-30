@@ -13,6 +13,7 @@
 NimBLECharacteristic *fromNumCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
+NimBLECharacteristic *logRadioDeprecatedCharacteristic;
 NimBLEServer *bleServer;
 
 static bool passkeyShowing;
@@ -208,6 +209,8 @@ void NimbleBluetooth::setupService()
         fromNumCharacteristic = bleService->createCharacteristic(FROMNUM_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
         logRadioCharacteristic =
             bleService->createCharacteristic(LOGRADIO_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ, 512U);
+        logRadioDeprecatedCharacteristic =
+            bleService->createCharacteristic(LOGRADIO_DEPRECATED_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ, 512U);
     } else {
         ToRadioCharacteristic = bleService->createCharacteristic(
             TORADIO_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_AUTHEN | NIMBLE_PROPERTY::WRITE_ENC);
@@ -218,6 +221,9 @@ void NimbleBluetooth::setupService()
                                                                NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC);
         logRadioCharacteristic = bleService->createCharacteristic(
             LOGRADIO_UUID,
+            NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC, 512U);
+        logRadioDeprecatedCharacteristic = bleService->createCharacteristic(
+            LOGRADIO_DEPRECATED_UUID,
             NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC, 512U);
         logRadioCharacteristic->setValue("Init");
     }
@@ -268,12 +274,12 @@ void NimbleBluetooth::clearBonds()
     NimBLEDevice::deleteAllBonds();
 }
 
-void NimbleBluetooth::sendLog(const char *logMessage)
+void NimbleBluetooth::sendLog(const uint8_t *bytes, size_t numBytes, bool useDeprecated = false)
 {
-    if (!bleServer || !isConnected() || strlen(logMessage) > 512) {
+    if (!bleServer || !isConnected() || numBytes > 512) {
         return;
     }
-    logRadioCharacteristic->notify(reinterpret_cast<const uint8_t *>(logMessage), strlen(logMessage), true);
+    (useDeprecated ? logRadioDeprecatedCharacteristic : logRadioCharacteristic)->notify(bytes, numBytes, true);
 }
 
 void clearNVS()

@@ -12,6 +12,7 @@ static BLECharacteristic fromNum = BLECharacteristic(BLEUuid(FROMNUM_UUID_16));
 static BLECharacteristic fromRadio = BLECharacteristic(BLEUuid(FROMRADIO_UUID_16));
 static BLECharacteristic toRadio = BLECharacteristic(BLEUuid(TORADIO_UUID_16));
 static BLECharacteristic logRadio = BLECharacteristic(BLEUuid(LOGRADIO_UUID_16));
+static BLECharacteristic logRadioDeprecated = BLECharacteristic(BLEUuid(LOGRADIO_DEPRECATED_UUID_16));
 
 static BLEDis bledis; // DIS (Device Information Service) helper class instance
 static BLEBas blebas; // BAS (Battery Service) helper class instance
@@ -182,6 +183,13 @@ void setupMeshService(void)
     logRadio.setCccdWriteCallback(onCccd);
     logRadio.write32(0);
     logRadio.begin();
+
+    logRadioDeprecated.setProperties(CHR_PROPS_NOTIFY | CHR_PROPS_READ);
+    logRadioDeprecated.setPermission(secMode, SECMODE_NO_ACCESS);
+    logRadioDeprecated.setMaxLen(512);
+    logRadioDeprecated.setCccdWriteCallback(onCccd);
+    logRadioDeprecated.write32(0);
+    logRadioDeprecated.begin();
 }
 static uint32_t configuredPasskey;
 void NRF52Bluetooth::shutdown()
@@ -334,9 +342,9 @@ void NRF52Bluetooth::onPairingCompleted(uint16_t conn_handle, uint8_t auth_statu
     screen->endAlert();
 }
 
-void NRF52Bluetooth::sendLog(const char *logMessage)
+void NRF52Bluetooth::sendLog(const uint8_t *bytes, size_t numBytes, bool useDeprecated)
 {
-    if (!isConnected() || strlen(logMessage) > 512)
+    if (!isConnected() || numBytes > 512)
         return;
-    logRadio.notify(logMessage);
+    (useDeprecated ? logRadioDeprecated : logRadio).notify(bytes, (uint16_t)numBytes);
 }

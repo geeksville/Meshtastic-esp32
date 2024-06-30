@@ -172,13 +172,17 @@ void RedirectablePrint::log_to_syslog(const char *logLevel, const char *format, 
 
 void RedirectablePrint::log_to_ble(const char *logLevel, const char *format, va_list arg)
 {
+#if HAS_BLUETOOTH
+#ifdef ARCH_ESP32
+    auto bt = nimbleBluetooth;
+#else
+    auto bt = nrf52Bluetooth;
+#endif
+
     if (config.bluetooth.device_logging_enabled && !pauseBluetoothLogging) {
         bool isBleConnected = false;
-#ifdef ARCH_ESP32
-        isBleConnected = nimbleBluetooth && nimbleBluetooth->isActive() && nimbleBluetooth->isConnected();
-#elif defined(ARCH_NRF52)
-        isBleConnected = nrf52Bluetooth != nullptr && nrf52Bluetooth->isConnected();
-#endif
+        isBleConnected = bt && bt->isActive() && bt->isConnected();
+
         if (isBleConnected) {
             char *message;
             size_t initialLen;
@@ -192,20 +196,16 @@ void RedirectablePrint::log_to_ble(const char *logLevel, const char *format, va_
                 vsnprintf(message, len + 1, format, arg);
             }
             auto thread = concurrency::OSThread::currentThread;
-#ifdef ARCH_ESP32
-            if (thread)
-                nimbleBluetooth->sendLog(mt_sprintf("%s | [%s] %s", logLevel, thread->ThreadName.c_str(), message).c_str());
-            else
-                nimbleBluetooth->sendLog(mt_sprintf("%s | %s", logLevel, message).c_str());
-#elif defined(ARCH_NRF52)
-            if (thread)
-                nrf52Bluetooth->sendLog(mt_sprintf("%s | [%s] %s", logLevel, thread->ThreadName.c_str(), message).c_str());
-            else
-                nrf52Bluetooth->sendLog(mt_sprintf("%s | %s", logLevel, message).c_str());
-#endif
+
+            auto log_str = thread ? mt_sprintf("%s | [%s] %s", logLevel, thread->ThreadName.c_str(), message)
+                                  : mt_sprintf("%s | %s", logLevel, message);
+
+            auto log_cstr = log_str.c_str();
+            bt->sendLog((const uint8_t *)log_cstr, strlen(log_cstr), true);
             delete[] message;
         }
     }
+#endif
 }
 
 void RedirectablePrint::log(const char *logLevel, const char *format, ...)

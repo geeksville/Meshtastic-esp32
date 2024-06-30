@@ -11,7 +11,7 @@ class NimbleBluetooth : BluetoothApi
     bool isActive();
     bool isConnected();
     int getRssi();
-    void sendLog(const char *logMessage);
+    void sendLog(const uint8_t *bytes, size_t numBytes, bool useDeprecated = false);
 
   private:
     void setupService();
