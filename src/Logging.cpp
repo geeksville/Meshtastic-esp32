@@ -1,0 +1,279 @@
+#include "Logging.h"
+#include "NodeDB.h"
+#include "RTC.h"
+#include "concurrency/OSThread.h"
+#include "configuration.h"
+#include "main.h"
+#include <assert.h>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <sys/time.h>
+#include <time.h>
+
+#ifdef ARCH_PORTDUINO
+#include "platform/portduino/PortduinoGlue.h"
+#endif
+
+#if HAS_WIFI || HAS_ETHERNET
+extern Syslog syslog;
+#endif
+Logging::Logging()
+{
+#ifdef HAS_FREE_RTOS
+    inDebugPrint = xSemaphoreCreateMutexStatic(&this->_MutexStorageSpace);
+#endif
+}
+
+size_t Logging::vprintf(const char *logLevel, const char *format, va_list arg)
+{
+    va_list copy;
+    static char printBuf[160];
+
+    va_copy(copy, arg);
+    size_t len = vsnprintf(printBuf, sizeof(printBuf), format, copy);
+    va_end(copy);
+
+    // If the resulting string is longer than sizeof(printBuf)-1 characters, the remaining characters are still counted for the
+    // return value
+
+    if (len > sizeof(printBuf) - 1) {
+        len = sizeof(printBuf) - 1;
+        printBuf[sizeof(printBuf) - 2] = '\n';
+    }
+    for (size_t f = 0; f < len; f++) {
+        if (!std::isprint(static_cast<unsigned char>(printBuf[f])) && printBuf[f] != '\n')
+            printBuf[f] = '#';
+    }
+    if (logLevel != nullptr) {
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_DEBUG) == 0)
+            Print::write("\u001b[34m", 6);
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_INFO) == 0)
+            Print::write("\u001b[32m", 6);
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_WARN) == 0)
+            Print::write("\u001b[33m", 6);
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_ERROR) == 0)
+            Print::write("\u001b[31m", 6);
+    }
+    len = Print::write(printBuf, len);
+    Print::write("\u001b[0m", 5);
+    return len;
+}
+
+void Logging::log_to_serial(const char *logLevel, const char *format, va_list arg)
+{
+    size_t r = 0;
+
+    // Cope with 0 len format strings, but look for new line terminator
+    bool hasNewline = *format && format[strlen(format) - 1] == '\n';
+
+    // If we are the first message on a report, include the header
+    if (!isContinuationMessage) {
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_DEBUG) == 0)
+            Print::write("\u001b[34m", 6);
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_INFO) == 0)
+            Print::write("\u001b[32m", 6);
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_WARN) == 0)
+            Print::write("\u001b[33m", 6);
+        if (strcmp(logLevel, MESHTASTIC_LOG_LEVEL_ERROR) == 0)
+            Print::write("\u001b[31m", 6);
+        uint32_t rtc_sec = getValidTime(RTCQuality::RTCQualityDevice, true); // display local time on logfile
+        if (rtc_sec > 0) {
+            long hms = rtc_sec % SEC_PER_DAY;
+            // hms += tz.tz_dsttime * SEC_PER_HOUR;
+            // hms -= tz.tz_minuteswest * SEC_PER_MIN;
+            // mod `hms` to ensure in positive range of [0...SEC_PER_DAY)
+            hms = (hms + SEC_PER_DAY) % SEC_PER_DAY;
+
+            // Tear apart hms into h:m:s
+            int hour = hms / SEC_PER_HOUR;
+            int min = (hms % SEC_PER_HOUR) / SEC_PER_MIN;
+            int sec = (hms % SEC_PER_HOUR) % SEC_PER_MIN; // or hms % SEC_PER_MIN
+#ifdef ARCH_PORTDUINO
+            ::printf("%s \u001b[0m| %02d:%02d:%02d %u ", logLevel, hour, min, sec, millis() / 1000);
+#else
+            printf("%s \u001b[0m| %02d:%02d:%02d %u ", logLevel, hour, min, sec, millis() / 1000);
+#endif
+        } else
+#ifdef ARCH_PORTDUINO
+            ::printf("%s \u001b[0m| ??:??:?? %u ", logLevel, millis() / 1000);
+#else
+            printf("%s \u001b[0m| ??:??:?? %u ", logLevel, millis() / 1000);
+#endif
+
+        auto thread = concurrency::OSThread::currentThread;
+        if (thread) {
+            print("[");
+            // printf("%p ", thread);
+            // assert(thread->ThreadName.length());
+            print(thread->ThreadName);
+            print("] ");
+        }
+    }
+    r += vprintf(logLevel, format, arg);
+
+    isContinuationMessage = !hasNewline;
+}
+
+void Logging::log_to_syslog(const char *logLevel, const char *format, va_list arg)
+{
+#if (HAS_WIFI || HAS_ETHERNET) && !defined(ARCH_PORTDUINO)
+    // if syslog is in use, collect the log messages and send them to syslog
+    if (syslog.isEnabled()) {
+        int ll = 0;
+        switch (logLevel[0]) {
+        case 'D':
+            ll = SYSLOG_DEBUG;
+            break;
+        case 'I':
+            ll = SYSLOG_INFO;
+            break;
+        case 'W':
+            ll = SYSLOG_WARN;
+            break;
+        case 'E':
+            ll = SYSLOG_ERR;
+            break;
+        case 'C':
+            ll = SYSLOG_CRIT;
+            break;
+        default:
+            ll = 0;
+        }
+        auto thread = concurrency::OSThread::currentThread;
+        if (thread) {
+            syslog.vlogf(ll, thread->ThreadName.c_str(), format, arg);
+        } else {
+            syslog.vlogf(ll, format, arg);
+        }
+    }
+#endif
+}
+
+void Logging::log_to_ble(const char *logLevel, const char *format, va_list arg)
+{
+#if HAS_BLUETOOTH
+#ifdef ARCH_ESP32
+    auto bt = nimbleBluetooth;
+#else
+    auto bt = nrf52Bluetooth;
+#endif
+
+    if (config.bluetooth.device_logging_enabled && !pauseBluetoothLogging) {
+        bool isBleConnected = false;
+        isBleConnected = bt && bt->isActive() && bt->isConnected();
+
+        if (isBleConnected) {
+            char *message;
+            size_t initialLen;
+            size_t len;
+            initialLen = strlen(format);
+            message = new char[initialLen + 1];
+            len = vsnprintf(message, initialLen + 1, format, arg);
+            if (len > initialLen) {
+                delete[] message;
+                message = new char[len + 1];
+                vsnprintf(message, len + 1, format, arg);
+            }
+            auto thread = concurrency::OSThread::currentThread;
+
+            auto log_str = thread ? mt_sprintf("%s | [%s] %s", logLevel, thread->ThreadName.c_str(), message)
+                                  : mt_sprintf("%s | %s", logLevel, message);
+
+            auto log_cstr = log_str.c_str();
+            bt->sendLog((const uint8_t *)log_cstr, strlen(log_cstr), true);
+            delete[] message;
+        }
+    }
+#endif
+}
+
+void Logging::log(const char *logLevel, const char *format, ...)
+{
+#ifdef ARCH_PORTDUINO
+    if (settingsMap[logoutputlevel] < level_debug && strcmp(logLevel, MESHTASTIC_LOG_LEVEL_DEBUG) == 0)
+        return;
+    else if (settingsMap[logoutputlevel] < level_info && strcmp(logLevel, MESHTASTIC_LOG_LEVEL_INFO) == 0)
+        return;
+    else if (settingsMap[logoutputlevel] < level_warn && strcmp(logLevel, MESHTASTIC_LOG_LEVEL_WARN) == 0)
+        return;
+#endif
+    if (moduleConfig.serial.override_console_serial_port && strcmp(logLevel, MESHTASTIC_LOG_LEVEL_DEBUG) == 0) {
+        return;
+    }
+
+#ifdef HAS_FREE_RTOS
+    if (inDebugPrint != nullptr && xSemaphoreTake(inDebugPrint, portMAX_DELAY) == pdTRUE) {
+#else
+    if (!inDebugPrint) {
+        inDebugPrint = true;
+#endif
+
+        va_list arg;
+        va_start(arg, format);
+
+        log_to_serial(logLevel, format, arg);
+        log_to_syslog(logLevel, format, arg);
+        log_to_ble(logLevel, format, arg);
+
+        va_end(arg);
+#ifdef HAS_FREE_RTOS
+        xSemaphoreGive(inDebugPrint);
+#else
+        inDebugPrint = false;
+#endif
+    }
+
+    return;
+}
+
+void Logging::hexDump(const char *logLevel, unsigned char *buf, uint16_t len)
+{
+    const char alphabet[17] = "0123456789abcdef";
+    log(logLevel, "    +------------------------------------------------+ +----------------+\n");
+    log(logLevel, "    |.0 .1 .2 .3 .4 .5 .6 .7 .8 .9 .a .b .c .d .e .f | |      ASCII     |\n");
+    for (uint16_t i = 0; i < len; i += 16) {
+        if (i % 128 == 0)
+            log(logLevel, "    +------------------------------------------------+ +----------------+\n");
+        char s[] = "|                                                | |                |\n";
+        uint8_t ix = 1, iy = 52;
+        for (uint8_t j = 0; j < 16; j++) {
+            if (i + j < len) {
+                uint8_t c = buf[i + j];
+                s[ix++] = alphabet[(c >> 4) & 0x0F];
+                s[ix++] = alphabet[c & 0x0F];
+                ix++;
+                if (c > 31 && c < 128)
+                    s[iy++] = c;
+                else
+                    s[iy++] = '.';
+            }
+        }
+        uint8_t index = i / 16;
+        if (i < 256)
+            log(logLevel, " ");
+        log(logLevel, "%02x", index);
+        log(logLevel, ".");
+        log(logLevel, s);
+    }
+    log(logLevel, "    +------------------------------------------------+ +----------------+\n");
+}
+
+std::string Logging::mt_sprintf(const std::string fmt_str, ...)
+{
+    int n = ((int)fmt_str.size()) * 2; /* Reserve two times as much as the length of the fmt_str */
+    std::unique_ptr<char[]> formatted;
+    va_list ap;
+    while (1) {
+        formatted.reset(new char[n]); /* Wrap the plain char array into the unique_ptr */
+        strcpy(&formatted[0], fmt_str.c_str());
+        va_start(ap, fmt_str);
+        int final_n = vsnprintf(&formatted[0], n, fmt_str.c_str(), ap);
+        va_end(ap);
+        if (final_n < 0 || final_n >= n)
+            n += abs(final_n - n + 1);
+        else
+            break;
+    }
+    return std::string(formatted.get());
+}
