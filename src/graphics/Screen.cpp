@@ -21,6 +21,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 #include "Screen.h"
 #include "../userPrefs.h"
+#include "PowerMon.h"
 #include "configuration.h"
 #if HAS_SCREEN
 #include <OLEDDisplay.h>
@@ -36,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "gps/RTC.h"
 #include "graphics/ScreenFonts.h"
 #include "graphics/images.h"
+#include "input/ScanAndSelect.h"
 #include "input/TouchScreenImpl1.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
@@ -1574,6 +1576,7 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
     if (on != screenOn) {
         if (on) {
             LOG_INFO("Turning on screen\n");
+            powerMon->setState(meshtastic_PowerMon_State_Screen_On);
 #ifdef T_WATCH_S3
             PMU->enablePowerOutput(XPOWERS_ALDO2);
 #endif
@@ -1588,6 +1591,9 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
 
             dispdev->displayOn();
 #ifdef USE_ST7789
+            pinMode(VTFT_CTRL, OUTPUT);
+            digitalWrite(VTFT_CTRL, LOW);
+            ui->init();
 #ifdef ESP_PLATFORM
             analogWrite(VTFT_LEDA, BRIGHTNESS_DEFAULT);
 #else
@@ -1599,16 +1605,28 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
             setInterval(0); // Draw ASAP
             runASAP = true;
         } else {
+            powerMon->clearState(meshtastic_PowerMon_State_Screen_On);
 #ifdef USE_EINK
             // eInkScreensaver parameter is usually NULL (default argument), default frame used instead
             setScreensaverFrames(einkScreensaver);
 #endif
             LOG_INFO("Turning off screen\n");
             dispdev->displayOff();
-
 #ifdef USE_ST7789
-            pinMode(VTFT_LEDA, OUTPUT);
-            digitalWrite(VTFT_LEDA, !TFT_BACKLIGHT_ON);
+            SPI1.end();
+#if defined(ARCH_ESP32)
+            pinMode(VTFT_LEDA, ANALOG);
+            pinMode(VTFT_CTRL, ANALOG);
+            pinMode(ST7789_RESET, ANALOG);
+            pinMode(ST7789_RS, ANALOG);
+            pinMode(ST7789_NSS, ANALOG);
+#else
+            nrf_gpio_cfg_default(VTFT_LEDA);
+            nrf_gpio_cfg_default(VTFT_CTRL);
+            nrf_gpio_cfg_default(ST7789_RESET);
+            nrf_gpio_cfg_default(ST7789_RS);
+            nrf_gpio_cfg_default(ST7789_NSS);
+#endif
 #endif
 
 #ifdef T_WATCH_S3
@@ -2288,6 +2306,11 @@ void Screen::handlePrint(const char *text)
 
 void Screen::handleOnPress()
 {
+    // If Canned Messages is using the "Scan and Select" input, dismiss the canned message frame when user button is pressed
+    // Minimize impact as a courtesy, as "scan and select" may be used as default config for some boards
+    if (scanAndSelectInput != nullptr && scanAndSelectInput->dismissCannedMessageFrame())
+        return;
+
     // If screen was off, just wake it, otherwise advance to next frame
     // If we are in a transition, the press must have bounced, drop it.
     if (ui->getUiState()->frameState == FIXED) {

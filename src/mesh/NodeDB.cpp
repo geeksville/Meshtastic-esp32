@@ -14,10 +14,12 @@
 #include "PowerFSM.h"
 #include "RTC.h"
 #include "Router.h"
+#include "SafeFile.h"
 #include "TypeConversions.h"
 #include "error.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
+#include "meshUtils.h"
 #include "modules/NeighborInfoModule.h"
 #include <ErriezCRC32.h>
 #include <algorithm>
@@ -53,6 +55,7 @@ meshtastic_LocalConfig config;
 meshtastic_LocalModuleConfig moduleConfig;
 meshtastic_ChannelFile channelFile;
 meshtastic_OEMStore oemStore;
+static bool hasOemStore = false;
 
 bool meshtastic_DeviceState_callback(pb_istream_t *istream, pb_ostream_t *ostream, const pb_field_iter_t *field)
 {
@@ -121,7 +124,38 @@ NodeDB::NodeDB()
 
     // Include our owner in the node db under our nodenum
     meshtastic_NodeInfoLite *info = getOrCreateMeshNode(getNodeNum());
-    info->user = owner;
+    if (!config.has_security) {
+        config.has_security = true;
+        config.security.serial_enabled = config.device.serial_enabled;
+        config.security.bluetooth_logging_enabled = config.bluetooth.device_logging_enabled;
+        config.security.is_managed = config.device.is_managed;
+    }
+#if !(MESHTASTIC_EXCLUDE_PKI)
+    // Calculate Curve25519 public and private keys
+    printBytes("Old Pubkey", config.security.public_key.bytes, 32);
+    if (config.security.private_key.size == 32 && config.security.public_key.size == 32) {
+        LOG_INFO("Using saved PKI keys\n");
+        owner.public_key.size = config.security.public_key.size;
+        memcpy(owner.public_key.bytes, config.security.public_key.bytes, config.security.public_key.size);
+        crypto->setDHPrivateKey(config.security.private_key.bytes);
+    } else {
+#if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN)
+        LOG_INFO("Generating new PKI keys\n");
+        crypto->generateKeyPair(config.security.public_key.bytes, config.security.private_key.bytes);
+        config.security.public_key.size = 32;
+        config.security.private_key.size = 32;
+
+        printBytes("New Pubkey", config.security.public_key.bytes, 32);
+        owner.public_key.size = 32;
+        memcpy(owner.public_key.bytes, config.security.public_key.bytes, 32);
+#else
+        LOG_INFO("No PKI keys set, and generation disabled!\n");
+#endif
+    }
+
+#endif
+
+    info->user = TypeConversions::ConvertToUserLite(owner);
     info->has_user = true;
 
 #ifdef ARCH_ESP32
@@ -188,7 +222,7 @@ bool NodeDB::resetRadioConfig(bool factory_reset)
     return didFactoryReset;
 }
 
-bool NodeDB::factoryReset()
+bool NodeDB::factoryReset(bool eraseBleBonds)
 {
     LOG_INFO("Performing factory reset!\n");
     // first, remove the "/prefs" (this removes most prefs)
@@ -205,18 +239,21 @@ bool NodeDB::factoryReset()
     installDefaultChannels();
     // third, write everything to disk
     saveToDisk();
+    if (eraseBleBonds) {
+        LOG_INFO("Erasing BLE bonds\n");
 #ifdef ARCH_ESP32
-    // This will erase what's in NVS including ssl keys, persistent variables and ble pairing
-    nvs_flash_erase();
+        // This will erase what's in NVS including ssl keys, persistent variables and ble pairing
+        nvs_flash_erase();
 #endif
 #ifdef ARCH_NRF52
-    Bluefruit.begin();
-    LOG_INFO("Clearing bluetooth bonds!\n");
-    bond_print_list(BLE_GAP_ROLE_PERIPH);
-    bond_print_list(BLE_GAP_ROLE_CENTRAL);
-    Bluefruit.Periph.clearBonds();
-    Bluefruit.Central.clearBonds();
+        Bluefruit.begin();
+        LOG_INFO("Clearing bluetooth bonds!\n");
+        bond_print_list(BLE_GAP_ROLE_PERIPH);
+        bond_print_list(BLE_GAP_ROLE_CENTRAL);
+        Bluefruit.Periph.clearBonds();
+        Bluefruit.Central.clearBonds();
 #endif
+    }
     return true;
 }
 
@@ -232,6 +269,7 @@ void NodeDB::installDefaultConfig()
     config.has_power = true;
     config.has_network = true;
     config.has_bluetooth = (HAS_BLUETOOTH ? true : false);
+    config.has_security = true;
     config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_ALL;
 
     config.lora.sx126x_rx_boosted_gain = true;
@@ -254,6 +292,14 @@ void NodeDB::installDefaultConfig()
 #else
     config.lora.ignore_mqtt = false;
 #endif
+#ifdef ADMIN_KEY_USERPREFS
+    memcpy(config.security.admin_key.bytes, admin_key_userprefs, 32);
+    config.security.admin_key.size = 32;
+#else
+    config.security.admin_key.size = 0;
+#endif
+    config.security.public_key.size = 0;
+    config.security.private_key.size = 0;
 #ifdef PIN_GPS_EN
     config.position.gps_en_gpio = PIN_GPS_EN;
 #endif
@@ -277,7 +323,8 @@ void NodeDB::installDefaultConfig()
     config.position.broadcast_smart_minimum_interval_secs = 30;
     if (config.device.role != meshtastic_Config_DeviceConfig_Role_ROUTER)
         config.device.node_info_broadcast_secs = default_node_info_broadcast_secs;
-    config.device.serial_enabled = true;
+    config.security.serial_enabled = true;
+    config.security.admin_channel_enabled = false;
     resetRadioConfig();
     strncpy(config.network.ntp_server, "meshtastic.pool.ntp.org", 32);
     // FIXME: Default to bluetooth capability of platform as default
@@ -371,6 +418,13 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.external_notification.output_ms = 100;
     moduleConfig.external_notification.active = true;
 #endif
+#ifdef BUTTON_SECONDARY_CANNEDMESSAGES
+    // Use a board's second built-in button as input source for canned messages
+    moduleConfig.canned_message.enabled = true;
+    moduleConfig.canned_message.inputbroker_pin_press = BUTTON_PIN_SECONDARY;
+    strcpy(moduleConfig.canned_message.allow_input_source, "scanAndSelect");
+#endif
+
     moduleConfig.has_canned_message = true;
 
     strncpy(moduleConfig.mqtt.address, default_mqtt_address, sizeof(moduleConfig.mqtt.address));
@@ -500,10 +554,21 @@ void NodeDB::cleanupMeshDB()
 {
     int newPos = 0, removed = 0;
     for (int i = 0; i < numMeshNodes; i++) {
-        if (meshNodes->at(i).has_user)
+        if (meshNodes->at(i).has_user) {
+            if (meshNodes->at(i).user.public_key.size > 0) {
+                for (int j = 0; j < numMeshNodes; j++) {
+                    if (meshNodes->at(i).user.public_key.bytes[j] != 0) {
+                        break;
+                    }
+                    if (j == 31) {
+                        meshNodes->at(i).user.public_key.size = 0;
+                    }
+                }
+            }
             meshNodes->at(newPos++) = meshNodes->at(i);
-        else
+        } else {
             removed++;
+        }
     }
     numMeshNodes -= removed;
     std::fill(devicestate.node_db_lite.begin() + numMeshNodes, devicestate.node_db_lite.begin() + numMeshNodes + removed,
@@ -530,8 +595,16 @@ void NodeDB::installDefaultDeviceState()
 
     // Set default owner name
     pickNewNodeNum(); // based on macaddr now
+#ifdef CONFIG_OWNER_LONG_NAME_USERPREFS
+    snprintf(owner.long_name, sizeof(owner.long_name), CONFIG_OWNER_LONG_NAME_USERPREFS);
+#else
     snprintf(owner.long_name, sizeof(owner.long_name), "Meshtastic %02x%02x", ourMacAddr[4], ourMacAddr[5]);
+#endif
+#ifdef CONFIG_OWNER_SHORT_NAME_USERPREFS
+    snprintf(owner.short_name, sizeof(owner.short_name), CONFIG_OWNER_SHORT_NAME_USERPREFS);
+#else
     snprintf(owner.short_name, sizeof(owner.short_name), "%02x%02x", ourMacAddr[4], ourMacAddr[5]);
+#endif
     snprintf(owner.id, sizeof(owner.id), "!%08x", getNodeNum()); // Default node ID now based on nodenum
     memcpy(owner.macaddr, ourMacAddr, sizeof(owner.macaddr));
 }
@@ -576,11 +649,6 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
     LoadFileResult state = LoadFileResult::OTHER_FAILURE;
 #ifdef FSCom
 
-    if (!FSCom.exists(filename)) {
-        LOG_INFO("File %s not found\n", filename);
-        return LoadFileResult::NOT_FOUND;
-    }
-
     auto f = FSCom.open(filename, FILE_O_READ);
 
     if (f) {
@@ -608,22 +676,30 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
 
 void NodeDB::loadFromDisk()
 {
+    devicestate.version =
+        0; // Mark the current device state as completely unusable, so that if we fail reading the entire file from
+    // disk we will still factoryReset to restore things.
+
     // static DeviceState scratch; We no longer read into a tempbuf because this structure is 15KB of valuable RAM
     auto state = loadProto(prefFileName, sizeof(meshtastic_DeviceState) + MAX_NUM_NODES * sizeof(meshtastic_NodeInfo),
                            sizeof(meshtastic_DeviceState), &meshtastic_DeviceState_msg, &devicestate);
 
-    if (state != LoadFileResult::LOAD_SUCCESS) {
-        installDefaultDeviceState(); // Our in RAM copy might now be corrupt
+    // See https://github.com/meshtastic/firmware/issues/4184#issuecomment-2269390786
+    // It is very important to try and use the saved prefs even if we fail to read meshtastic_DeviceState.  Because most of our
+    // critical config may still be valid (in the other files - loaded next).
+    // Also, if we did fail on reading we probably failed on the enormous (and non critical) nodeDB.  So DO NOT install default
+    // device state.
+    // if (state != LoadFileResult::LOAD_SUCCESS) {
+    //    installDefaultDeviceState(); // Our in RAM copy might now be corrupt
+    //} else {
+    if (devicestate.version < DEVICESTATE_MIN_VER) {
+        LOG_WARN("Devicestate %d is old, discarding\n", devicestate.version);
+        factoryReset();
     } else {
-        if (devicestate.version < DEVICESTATE_MIN_VER) {
-            LOG_WARN("Devicestate %d is old, discarding\n", devicestate.version);
-            factoryReset();
-        } else {
-            LOG_INFO("Loaded saved devicestate version %d, with nodecount: %d\n", devicestate.version,
-                     devicestate.node_db_lite.size());
-            meshNodes = &devicestate.node_db_lite;
-            numMeshNodes = devicestate.node_db_lite.size();
-        }
+        LOG_INFO("Loaded saved devicestate version %d, with nodecount: %d\n", devicestate.version,
+                 devicestate.node_db_lite.size());
+        meshNodes = &devicestate.node_db_lite;
+        numMeshNodes = devicestate.node_db_lite.size();
     }
     meshNodes->resize(MAX_NUM_NODES);
 
@@ -669,6 +745,7 @@ void NodeDB::loadFromDisk()
     state = loadProto(oemConfigFile, meshtastic_OEMStore_size, sizeof(meshtastic_OEMStore), &meshtastic_OEMStore_msg, &oemStore);
     if (state == LoadFileResult::LOAD_SUCCESS) {
         LOG_INFO("Loaded OEMStore\n");
+        hasOemStore = true;
     }
 
     // 2.4.X - configuration migration to update new default intervals
@@ -693,48 +770,26 @@ void NodeDB::loadFromDisk()
 }
 
 /** Save a protobuf from a file, return true for success */
-bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t *fields, const void *dest_struct)
+bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t *fields, const void *dest_struct,
+                       bool fullAtomic)
 {
     bool okay = false;
 #ifdef FSCom
-    // static DeviceState scratch; We no longer read into a tempbuf because this structure is 15KB of valuable RAM
-    String filenameTmp = filename;
-    filenameTmp += ".tmp";
-    auto f = FSCom.open(filenameTmp.c_str(), FILE_O_WRITE);
-    if (f) {
-        LOG_INFO("Saving %s\n", filename);
-        pb_ostream_t stream = {&writecb, &f, protoSize};
+    auto f = SafeFile(filename, fullAtomic);
 
-        if (!pb_encode(&stream, fields, dest_struct)) {
-            LOG_ERROR("Error: can't encode protobuf %s\n", PB_GET_ERROR(&stream));
-        } else {
-            okay = true;
-        }
-        f.flush();
-        f.close();
+    LOG_INFO("Saving %s\n", filename);
+    pb_ostream_t stream = {&writecb, static_cast<Print *>(&f), protoSize};
 
-        // brief window of risk here ;-)
-        if (FSCom.exists(filename) && !FSCom.remove(filename)) {
-            LOG_WARN("Can't remove old pref file\n");
-        }
-        if (!renameFile(filenameTmp.c_str(), filename)) {
-            LOG_ERROR("Error: can't rename new pref file\n");
-        }
+    if (!pb_encode(&stream, fields, dest_struct)) {
+        LOG_ERROR("Error: can't encode protobuf %s\n", PB_GET_ERROR(&stream));
     } else {
-        LOG_ERROR("Can't write prefs\n");
-#ifdef ARCH_NRF52
-        static uint8_t failedCounter = 0;
-        failedCounter++;
-        if (failedCounter >= 2) {
-            LOG_ERROR("Failed to save file twice. Rebooting...\n");
-            delay(100);
-            NVIC_SystemReset();
-            // We used to blow away the filesystem here, but that's a bit extreme
-            // FSCom.format();
-            // // After formatting, the device needs to be restarted
-            // nodeDB->resetRadioConfig(true);
-        }
-#endif
+        okay = true;
+    }
+
+    bool writeSucceeded = f.close();
+
+    if (!okay || !writeSucceeded) {
+        LOG_ERROR("Can't write prefs!\n");
     }
 #else
     LOG_ERROR("ERROR: Filesystem not implemented\n");
@@ -742,32 +797,32 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
     return okay;
 }
 
-void NodeDB::saveChannelsToDisk()
+bool NodeDB::saveChannelsToDisk()
 {
 #ifdef FSCom
     FSCom.mkdir("/prefs");
 #endif
-    saveProto(channelFileName, meshtastic_ChannelFile_size, &meshtastic_ChannelFile_msg, &channelFile);
+    return saveProto(channelFileName, meshtastic_ChannelFile_size, &meshtastic_ChannelFile_msg, &channelFile);
 }
 
-void NodeDB::saveDeviceStateToDisk()
+bool NodeDB::saveDeviceStateToDisk()
 {
 #ifdef FSCom
     FSCom.mkdir("/prefs");
 #endif
-    saveProto(prefFileName, sizeof(devicestate) + numMeshNodes * meshtastic_NodeInfoLite_size, &meshtastic_DeviceState_msg,
-              &devicestate);
+    // Note: if MAX_NUM_NODES=100 and meshtastic_NodeInfoLite_size=166, so will be approximately 17KB
+    // Because so huge we _must_ not use fullAtomic, because the filesystem is probably too small to hold two copies of this
+    return saveProto(prefFileName, sizeof(devicestate) + numMeshNodes * meshtastic_NodeInfoLite_size, &meshtastic_DeviceState_msg,
+                     &devicestate, false);
 }
 
-void NodeDB::saveToDisk(int saveWhat)
+bool NodeDB::saveToDiskNoRetry(int saveWhat)
 {
+    bool success = true;
+
 #ifdef FSCom
     FSCom.mkdir("/prefs");
 #endif
-    if (saveWhat & SEGMENT_DEVICESTATE) {
-        saveDeviceStateToDisk();
-    }
-
     if (saveWhat & SEGMENT_CONFIG) {
         config.has_device = true;
         config.has_display = true;
@@ -776,8 +831,9 @@ void NodeDB::saveToDisk(int saveWhat)
         config.has_power = true;
         config.has_network = true;
         config.has_bluetooth = true;
+        config.has_security = true;
 
-        saveProto(configFileName, meshtastic_LocalConfig_size, &meshtastic_LocalConfig_msg, &config);
+        success &= saveProto(configFileName, meshtastic_LocalConfig_size, &meshtastic_LocalConfig_msg, &config);
     }
 
     if (saveWhat & SEGMENT_MODULECONFIG) {
@@ -794,12 +850,45 @@ void NodeDB::saveToDisk(int saveWhat)
         moduleConfig.has_audio = true;
         moduleConfig.has_paxcounter = true;
 
-        saveProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, &meshtastic_LocalModuleConfig_msg, &moduleConfig);
+        success &=
+            saveProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, &meshtastic_LocalModuleConfig_msg, &moduleConfig);
+    }
+
+    // We might need to rewrite the OEM data if we are reformatting the FS
+    if ((saveWhat & SEGMENT_OEM) && hasOemStore) {
+        success &= saveProto(oemConfigFile, meshtastic_OEMStore_size, &meshtastic_OEMStore_msg, &oemStore);
     }
 
     if (saveWhat & SEGMENT_CHANNELS) {
-        saveChannelsToDisk();
+        success &= saveChannelsToDisk();
     }
+
+    if (saveWhat & SEGMENT_DEVICESTATE) {
+        success &= saveDeviceStateToDisk();
+    }
+
+    return success;
+}
+
+bool NodeDB::saveToDisk(int saveWhat)
+{
+    bool success = saveToDiskNoRetry(saveWhat);
+
+    if (!success) {
+        LOG_ERROR("Failed to save to disk, retrying...\n");
+#ifdef ARCH_NRF52 // @geeksville is not ready yet to say we should do this on other platforms.  See bug #4184 discussion
+        FSCom.format();
+
+        // We need to rewrite the OEM data if we are reformatting the FS
+        saveWhat |= SEGMENT_OEM;
+#endif
+        success = saveToDiskNoRetry(saveWhat);
+
+        RECORD_CRITICALERROR(success ? meshtastic_CriticalErrorCode_FLASH_CORRUPTION_RECOVERABLE
+                                     : meshtastic_CriticalErrorCode_FLASH_CORRUPTION_UNRECOVERABLE);
+    }
+
+    return success;
 }
 
 const meshtastic_NodeInfoLite *NodeDB::readNextMeshNode(uint32_t &readIndex)
@@ -922,23 +1011,38 @@ void NodeDB::updateTelemetry(uint32_t nodeId, const meshtastic_Telemetry &t, RxS
 
 /** Update user info and channel for this node based on received user data
  */
-bool NodeDB::updateUser(uint32_t nodeId, const meshtastic_User &p, uint8_t channelIndex)
+bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelIndex)
 {
     meshtastic_NodeInfoLite *info = getOrCreateMeshNode(nodeId);
     if (!info) {
         return false;
     }
 
-    LOG_DEBUG("old user %s/%s/%s, channel=%d\n", info->user.id, info->user.long_name, info->user.short_name, info->channel);
+    LOG_DEBUG("old user %s/%s, channel=%d\n", info->user.long_name, info->user.short_name, info->channel);
+#if !(MESHTASTIC_EXCLUDE_PKI)
+    if (p.public_key.size > 0) {
+        printBytes("Incoming Pubkey: ", p.public_key.bytes, 32);
+        if (info->user.public_key.size > 0) { // if we have a key for this user already, don't overwrite with a new one
+            LOG_INFO("Public Key set for node, not updateing!\n");
+            // we copy the key into the incoming packet, to prevent overwrite
+            memcpy(p.public_key.bytes, info->user.public_key.bytes, 32);
+        } else {
+            LOG_INFO("Updating Node Pubkey!\n");
+        }
+    }
+#endif
 
     // Both of info->user and p start as filled with zero so I think this is okay
     bool changed = memcmp(&info->user, &p, sizeof(info->user)) || (info->channel != channelIndex);
 
-    info->user = p;
+    info->user = TypeConversions::ConvertToUserLite(p);
+    if (info->user.public_key.size == 32) {
+        printBytes("Saved Pubkey: ", info->user.public_key.bytes, 32);
+    }
     if (nodeId != getNodeNum())
         info->channel = channelIndex; // Set channel we need to use to reach this node (but don't set our own channel)
-    LOG_DEBUG("updating changed=%d user %s/%s/%s, channel=%d\n", changed, info->user.id, info->user.long_name,
-              info->user.short_name, info->channel);
+    LOG_DEBUG("updating changed=%d user %s/%s, channel=%d\n", changed, info->user.long_name, info->user.short_name,
+              info->channel);
     info->has_user = true;
 
     if (changed) {
@@ -1007,18 +1111,32 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
     meshtastic_NodeInfoLite *lite = getMeshNode(n);
 
     if (!lite) {
-        if ((numMeshNodes >= MAX_NUM_NODES) || (memGet.getFreeHeap() < meshtastic_NodeInfoLite_size * 3)) {
+        if ((numMeshNodes >= MAX_NUM_NODES) || (memGet.getFreeHeap() < MINIMUM_SAFE_FREE_HEAP)) {
             if (screen)
                 screen->print("Warn: node database full!\nErasing oldest entry\n");
-            LOG_WARN("Node database full! Erasing oldest entry\n");
+            LOG_WARN("Node database full with %i nodes and %i bytes free! Erasing oldest entry\n", numMeshNodes,
+                     memGet.getFreeHeap());
             // look for oldest node and erase it
             uint32_t oldest = UINT32_MAX;
+            uint32_t oldestBoring = UINT32_MAX;
             int oldestIndex = -1;
+            int oldestBoringIndex = -1;
             for (int i = 1; i < numMeshNodes; i++) {
+                // Simply the oldest non-favorite node
                 if (!meshNodes->at(i).is_favorite && meshNodes->at(i).last_heard < oldest) {
                     oldest = meshNodes->at(i).last_heard;
                     oldestIndex = i;
                 }
+                // The oldest "boring" node
+                if (!meshNodes->at(i).is_favorite && meshNodes->at(i).user.public_key.size == 0 &&
+                    meshNodes->at(i).last_heard < oldestBoring) {
+                    oldestBoring = meshNodes->at(i).last_heard;
+                    oldestBoringIndex = i;
+                }
+            }
+            // if we found a "boring" node, evict it
+            if (oldestBoringIndex != -1) {
+                oldestIndex = oldestBoringIndex;
             }
             // Shove the remaining nodes down the chain
             for (int i = oldestIndex; i < numMeshNodes - 1; i++) {
@@ -1032,6 +1150,7 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         // everything is missing except the nodenum
         memset(lite, 0, sizeof(*lite));
         lite->num = n;
+        LOG_INFO("Adding node to database with %i nodes and %i bytes free!\n", numMeshNodes, memGet.getFreeHeap());
     }
 
     return lite;

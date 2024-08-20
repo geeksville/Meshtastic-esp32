@@ -97,7 +97,7 @@ void Channels::initDefaultChannel(ChannelIndex chIndex)
     channelSettings.psk.bytes[0] = defaultpskIndex;
     channelSettings.psk.size = 1;
     strncpy(channelSettings.name, "", sizeof(channelSettings.name));
-    channelSettings.module_settings.position_precision = 32; // default to sending location on the primary channel
+    channelSettings.module_settings.position_precision = 13; // default to sending location on the primary channel
     channelSettings.has_module_settings = true;
 
     ch.has_settings = true;
@@ -309,12 +309,14 @@ const char *Channels::getName(size_t chIndex)
     return channelName;
 }
 
-bool Channels::isDefaultChannel(const meshtastic_Channel &ch)
+bool Channels::isDefaultChannel(ChannelIndex chIndex)
 {
+    const auto &ch = getByIndex(chIndex);
     if (ch.settings.psk.size == 1 && ch.settings.psk.bytes[0] == 1) {
+        const char *name = getName(chIndex);
         const char *presetName = DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false);
         // Check if the name is the default derived from the modem preset
-        if (strcmp(ch.settings.name, presetName) == 0)
+        if (strcmp(name, presetName) == 0)
             return true;
     }
     return false;
@@ -327,8 +329,7 @@ bool Channels::hasDefaultChannel()
         return false;
     // Check if any of the channels are using the default name and PSK
     for (size_t i = 0; i < getNumChannels(); i++) {
-        const auto &ch = getByIndex(i);
-        if (isDefaultChannel(ch))
+        if (isDefaultChannel(i))
             return true;
     }
     return false;
